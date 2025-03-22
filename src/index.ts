@@ -1,21 +1,31 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import * as dotenv from "dotenv";
 
-const NWS_API_BASE = "https://api.weather.gov";
-const USER_AGENT = "weather-app/1.0";
+// Load environment variables from .env file
+dotenv.config();
 
 // Create server instance
 const server = new McpServer({
-  name: "weather",
+  name: "github-pullrequest-review",
   version: "1.0.0",
 });
 
-// Helper function for making NWS API requests
-async function makeNWSRequest<T>(url: string): Promise<T | null> {
+const GITHUB_API_BASE = "https://api.github.com";
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
+
+if (!GITHUB_TOKEN) {
+  console.error("GITHUB_TOKEN environment variable is not set");
+  process.exit(1);
+}
+
+// Helper function for making GitHub API requests
+async function makeGitHubRequest<T>(url: string): Promise<T | null> {
   const headers = {
-    "User-Agent": USER_AGENT,
-    Accept: "application/geo+json",
+    Authorization: `token ${GITHUB_TOKEN}`,
+    Accept: "application/vnd.github.v3+json",
+    "User-Agent": "github-pullrequest-review/1.0.0",
   };
 
   try {
@@ -25,104 +35,84 @@ async function makeNWSRequest<T>(url: string): Promise<T | null> {
     }
     return (await response.json()) as T;
   } catch (error) {
-    console.error("Error making NWS request:", error);
+    console.error("Error making GitHub request:", error);
     return null;
   }
 }
 
-interface AlertFeature {
-  properties: {
-    event?: string;
-    areaDesc?: string;
-    severity?: string;
-    status?: string;
-    headline?: string;
+interface PullRequest {
+  title: string;
+  html_url: string;
+  user: {
+    login: string;
   };
+  body: string;
+  created_at: string;
+  updated_at: string;
+  state: string;
+  number: number;
+  additions: number;
+  deletions: number;
+  changed_files: number;
 }
 
-// Format alert data
-function formatAlert(feature: AlertFeature): string {
-  const props = feature.properties;
-  return [
-    `Event: ${props.event || "Unknown"}`,
-    `Area: ${props.areaDesc || "Unknown"}`,
-    `Severity: ${props.severity || "Unknown"}`,
-    `Status: ${props.status || "Unknown"}`,
-    `Headline: ${props.headline || "No headline"}`,
-    "---",
-  ].join("\n");
+interface PullRequestFile {
+  filename: string;
+  additions: number;
+  deletions: number;
+  changes: number;
+  status: string;
+  contents_url: string;
+  patch?: string;
 }
 
-interface ForecastPeriod {
-  name?: string;
-  temperature?: number;
-  temperatureUnit?: string;
-  windSpeed?: string;
-  windDirection?: string;
-  shortForecast?: string;
-}
-
-interface AlertsResponse {
-  features: AlertFeature[];
-}
-
-interface PointsResponse {
-  properties: {
-    forecast?: string;
-  };
-}
-
-interface ForecastResponse {
-  properties: {
-    periods: ForecastPeriod[];
-  };
-}
-
-// Register weather tools
+// Register GitHub PR tools
 server.tool(
-  "get-alerts",
-  "Get weather alerts for a state",
+  "get-pull-request",
+  "Get information about a GitHub pull request",
   {
-    state: z.string().length(2).describe("Two-letter state code (e.g. CA, NY)"),
+    owner: z.string().describe("Repository owner/organization name"),
+    repo: z.string().describe("Repository name"),
+    pr_number: z.number().positive().describe("Pull request number"),
   },
-  async ({ state }) => {
-    const stateCode = state.toUpperCase();
-    const alertsUrl = `${NWS_API_BASE}/alerts?area=${stateCode}`;
-    const alertsData = await makeNWSRequest<AlertsResponse>(alertsUrl);
+  async ({ owner, repo, pr_number }) => {
+    const prUrl = `${GITHUB_API_BASE}/repos/${owner}/${repo}/pulls/${pr_number}`;
+    const prData = await makeGitHubRequest<PullRequest>(prUrl);
 
-    if (!alertsData) {
+    if (!prData) {
       return {
         content: [
           {
             type: "text",
-            text: "Failed to retrieve alerts data",
+            text: "Failed to retrieve pull request data",
           },
         ],
       };
     }
 
-    const features = alertsData.features || [];
-    if (features.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `No active alerts for ${stateCode}`,
-          },
-        ],
-      };
-    }
+    const prInfo = `
+# Pull Request: ${prData.title} (#${prData.number})
 
-    const formattedAlerts = features.map(formatAlert);
-    const alertsText = `Active alerts for ${stateCode}:\n\n${formattedAlerts.join(
-      "\n"
-    )}`;
+**Author:** ${prData.user.login}
+**URL:** ${prData.html_url}
+**State:** ${prData.state}
+**Created:** ${new Date(prData.created_at).toLocaleString()}
+**Updated:** ${new Date(prData.updated_at).toLocaleString()}
+
+**Changes:**
+- ${prData.changed_files} files changed
+- ${prData.additions} additions
+- ${prData.deletions} deletions
+
+**Description:**
+${prData.body || "No description provided"}
+`;
 
     return {
       content: [
         {
           type: "text",
-          text: alertsText,
+          text: prInfo,
         },
       ],
     };
@@ -130,85 +120,51 @@ server.tool(
 );
 
 server.tool(
-  "get-forecast",
-  "Get weather forecast for a location",
+  "get-pull-request-files",
+  "Get files changed in a GitHub pull request",
   {
-    latitude: z.number().min(-90).max(90).describe("Latitude of the location"),
-    longitude: z
-      .number()
-      .min(-180)
-      .max(180)
-      .describe("Longitude of the location"),
+    owner: z.string().describe("Repository owner/organization name"),
+    repo: z.string().describe("Repository name"),
+    pr_number: z.number().positive().describe("Pull request number"),
   },
-  async ({ latitude, longitude }) => {
-    // Get grid point data
-    const pointsUrl = `${NWS_API_BASE}/points/${latitude.toFixed(
-      4
-    )},${longitude.toFixed(4)}`;
-    const pointsData = await makeNWSRequest<PointsResponse>(pointsUrl);
+  async ({ owner, repo, pr_number }) => {
+    const filesUrl = `${GITHUB_API_BASE}/repos/${owner}/${repo}/pulls/${pr_number}/files`;
+    const filesData = await makeGitHubRequest<PullRequestFile[]>(filesUrl);
 
-    if (!pointsData) {
+    if (!filesData) {
       return {
         content: [
           {
             type: "text",
-            text: `Failed to retrieve grid point data for coordinates: ${latitude}, ${longitude}. This location may not be supported by the NWS API (only US locations are supported).`,
+            text: "Failed to retrieve pull request files data",
           },
         ],
       };
     }
 
-    const forecastUrl = pointsData.properties?.forecast;
-    if (!forecastUrl) {
+    if (filesData.length === 0) {
       return {
         content: [
           {
             type: "text",
-            text: "Failed to get forecast URL from grid point data",
+            text: "No files changed in this pull request",
           },
         ],
       };
     }
 
-    // Get forecast data
-    const forecastData = await makeNWSRequest<ForecastResponse>(forecastUrl);
-    if (!forecastData) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Failed to retrieve forecast data",
-          },
-        ],
-      };
-    }
+    const filesList = filesData.map((file) => {
+      return `
+## ${file.filename}
+- Status: ${file.status}
+- Changes: ${file.changes} (${file.additions} additions, ${
+        file.deletions
+      } deletions)
+${file.patch ? `\n\`\`\`diff\n${file.patch}\n\`\`\`` : ""}
+`;
+    });
 
-    const periods = forecastData.properties?.periods || [];
-    if (periods.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "No forecast periods available",
-          },
-        ],
-      };
-    }
-
-    // Format forecast periods
-    const formattedForecast = periods.map((period: ForecastPeriod) =>
-      [
-        `${period.name || "Unknown"}:`,
-        `Temperature: ${period.temperature || "Unknown"}°${
-          period.temperatureUnit || "F"
-        }`,
-        `Wind: ${period.windSpeed || "Unknown"} ${period.windDirection || ""}`,
-        `${period.shortForecast || "No forecast available"}`,
-        "---",
-      ].join("\n")
-    );
-
-    const forecastText = `Forecast for ${latitude}, ${longitude}:\n\n${formattedForecast.join(
+    const filesText = `# Files Changed in Pull Request\n\n${filesList.join(
       "\n"
     )}`;
 
@@ -216,7 +172,7 @@ server.tool(
       content: [
         {
           type: "text",
-          text: forecastText,
+          text: filesText,
         },
       ],
     };
@@ -226,7 +182,7 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Weather MCP Server running on stdio");
+  console.error("GitHub PR Review MCP Server running on stdio");
 }
 
 main().catch((error) => {
